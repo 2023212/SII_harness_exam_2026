@@ -1,0 +1,119 @@
+这里面的代码是一个用于小模型（8b）的harness系统，主要用于学习小批量将带标签的训练样本并更新记忆，然后在读取验证集中的text字段并预测该字段对应的标签是什么，标签可能是简单的ABCD，也有可能是对text的概括，简单来说就是把一句自然语言按照含义去分类归纳到一个特定的书签下面。
+现在你的任务是使用我给你的技术方案补全solution.py里的实现逻辑，具体要求如下：
+1、在输入训练集数据时首先提取出text字段的n-gram（n先取5），通过hashing trick将整个字段转化为一个向量，再将这个向量、text字段和label字段存储起来以供后期检索；
+2、在输入测试集数据时使用上面相同的方法将text字段转化成向量，检索训练集组成的数据库条目中向量的余弦相似度最高的top-5个数据，将其附在
+
+
+
+_TOKENIZER: dict = {}
+
+
+def _load_tokenizer() -> None:
+    """从 tokenizer/tokenizer.json 中加载 vocab 与 merges（仅加载一次）。"""
+    if _TOKENIZER:
+        return
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "tokenizer",
+        "tokenizer.json",
+    )
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    raw_merges = data["model"]["merges"]
+    merges = {}
+    for i, m in enumerate(raw_merges):
+        a, b = (m[0], m[1]) if isinstance(m, list) else m.split(" ", 1)
+        merges[(a, b)] = i
+
+    _TOKENIZER["vocab"] = data["model"]["vocab"]
+    _TOKENIZER["merges"] = merges
+    _TOKENIZER["added"] = {t["content"]: t["id"] for t in data.get("added_tokens", [])}
+
+
+def _build_byte_encoder() -> dict:
+    """GPT-2/Qwen2 的 byte-level 编码：将 0–255 字节映射为可见 unicode 字符。"""
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    cs, n = bs[:], 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+_BYTE_ENC = _build_byte_encoder()
+
+# Qwen2 / GPT-2 pre-tokenizer 正则。Python 标准库 re 不支持 \p{L}/\p{N}，
+# 这里用 \w（letter+digit+underscore+connector）与 \d（decimal digit）做近似，
+# 对常见英文/中文文本足够等价。
+_PRE_TOKEN_PATTERN = re.compile(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+    r"|[^\r\n\w]?[^\W\d_]+"
+    r"|\d"
+    r"| ?[^\s\w]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
+@lru_cache(maxsize=16384)
+def _bpe(token: str) -> tuple:
+    """对 byte-level 编码后的 pre-token 反复套用最小 rank 的 merge，得到子词序列。"""
+    merges = _TOKENIZER["merges"]
+    word = list(token)
+    while len(word) > 1:
+        best, best_rank = None, None
+        for i in range(len(word) - 1):
+            r = merges.get((word[i], word[i + 1]))
+            if r is not None and (best_rank is None or r < best_rank):
+                best, best_rank = (word[i], word[i + 1]), r
+        if best is None:
+            break
+        merged, i = [], 0
+        while i < len(word):
+            if i < len(word) - 1 and (word[i], word[i + 1]) == best:
+                merged.append(word[i] + word[i + 1])
+                i += 2
+            else:
+                merged.append(word[i])
+                i += 1
+        word = merged
+    return tuple(word)
+
+
+def tokenize(item) -> list:
+    """读取 jsonl 条目的 text 字段，并按 tokenizer.json 中的映射转化为 token id。
+
+    入参 `item` 与 run.py 中 `load_jsonl` 解析得到的元素一致，即形如
+    `{"text": "...", "label": "..."}` 的 dict；为方便复用，也允许直接传入文本字符串。
+    返回值是与该 text 对应的 token id 列表（不含特殊 token）。
+    """
+    _load_tokenizer()
+
+    # 1) 按 run.py 的方式取出 text 字段
+    text = item["text"] if isinstance(item, dict) else item
+
+    # 2) NFC 归一化（与 tokenizer.json 中 normalizer 一致）
+    text = unicodedata.normalize("NFC", text)
+
+    vocab = _TOKENIZER["vocab"]
+    ids: list = []
+
+    # 3) pre-tokenize → byte-level 编码 → BPE → 查 vocab
+    for pre in _PRE_TOKEN_PATTERN.findall(text):
+        if not pre:
+            continue
+        encoded = "".join(_BYTE_ENC[b] for b in pre.encode("utf-8"))
+        for sub in _bpe(encoded):
+            tid = vocab.get(sub)
+            if tid is not None:
+                ids.append(tid)
+    return ids
+

@@ -1,2 +1,4 @@
 # SII_harness_exam_2026
 2026年上海创智学院直博生夏令营harness engineering考试内容与个人作答情况存档
+总体内容就是设计一套harness系统让一个8B大模型在不微调的前提下使用有限的context window进行few-shot learning，具体细节见PDF
+本人全程Vibe coding，主要是使用LSA选出语义相似度最高的top-k个条目，同时将更多的语义相似度较高的条目的标签传入（只适用于标签是文本的概括），一同作为system prompt输入给大模型，利用大模型的语义理解能力进行选择。最后的精准度大概在75%左右，不算很高
